@@ -31,6 +31,15 @@ cp examples/cover_letter_prompt.example.md my/cover_letter_prompt.md
 ```dotenv
 LLM_PROVIDER=openai
 HH_USER_AGENT=hh-auto-apply/1.0 (your-email@example.com)
+HH_BROWSER_HEADERS=true
+HH_BROWSER_USER_AGENT=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36
+HH_ACCEPT_LANGUAGE=ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7
+HH_API_REFERER=https://hh.ru/
+HH_API_TIMEOUT_SECONDS=45
+HH_API_RETRIES=3
+HH_WEB_BASE=https://rostov.hh.ru
+HH_BROWSER_NAV_RETRIES=3
+HH_BROWSER_NAV_TIMEOUT_SECONDS=60
 OPENAI_API_KEY=sk-...
 OPENAI_MODEL=gpt-4o-mini
 ```
@@ -83,6 +92,12 @@ python3 auto_apply.py --once
 
 Скрипт найдет вакансии, сгенерирует письма и запишет результат в `data/hh_auto_apply.sqlite3`, но ничего не отправит.
 
+Для проверки только API-поиска без открытия fallback-браузера:
+
+```bash
+LLM_PROVIDER=none python3 auto_apply.py --once --max-applications 1 --no-browser-fallback
+```
+
 Когда письма и фильтры устраивают:
 
 ```bash
@@ -94,6 +109,20 @@ python3 auto_apply.py --once --apply
 ```bash
 python3 auto_apply.py --once --apply --max-applications 2
 ```
+
+Безопасный реальный тест одного отклика с ручным подтверждением перед финальной кнопкой:
+
+```bash
+python3 auto_apply.py --once --apply --max-applications 1 --confirm-submit
+```
+
+Тест по конкретной вакансии hh.ru, без случайного выбора из поиска:
+
+```bash
+python3 auto_apply.py --once --apply --vacancy-url "https://hh.ru/vacancy/123456789" --confirm-submit
+```
+
+В режиме `--confirm-submit` скрипт заполнит письмо и дополнительные вопросы, затем остановится. Чтобы реально отправить отклик, в терминале нужно ввести `send`. Успех записывается только после явного подтверждения на стороне hh.ru; если подтверждения нет, результат будет `error`, а HTML и скриншот сохранятся в `data/debug/`.
 
 ## Запуск 2 раза в день
 
@@ -127,11 +156,17 @@ python3 auto_apply.py --schedule --apply
 
 Технические настройки ниже:
 
+- `.env HH_BROWSER_HEADERS=true` - отправлять запросы к hh API с browser-like заголовками.
+- `.env HH_BROWSER_USER_AGENT` - User-Agent браузера для hh API; `HH_USER_AGENT` остается идентификатором приложения с контактной почтой.
+- `.env HH_WEB_BASE` - веб-хост hh для браузерного fallback, например `https://rostov.hh.ru`.
+- `.env HH_BROWSER_NAV_RETRIES` и `HH_BROWSER_NAV_TIMEOUT_SECONDS` - повторы и таймауты открытия страниц hh в Playwright.
+- `.env HH_BROWSER_CHANNEL=chrome` - опционально запускать установленный Google Chrome вместо bundled Chromium, если он установлен.
 - `search.title_only: true` - искать по названию вакансии.
 - `filters.skip_has_test: true` - пропускать вакансии с тестовым заданием.
 - `limits.max_applications_per_run` - потолок откликов за один запуск.
 - `letter.prompt_path` - путь к редактируемому промпту для сопроводительных писем.
 - `letter.extra_instructions` - стиль и правила сопроводительного письма.
+- `letter.forbidden_terms` - жесткий список слов или названий, при наличии которых письмо не будет отправлено.
 
 Промпт для писем можно править в `my/cover_letter_prompt.md`.
 

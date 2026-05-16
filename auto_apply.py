@@ -27,7 +27,7 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -36,9 +36,19 @@ DEFAULT_CONFIG_PATH = MY_DIR / "config.yaml"
 DEFAULT_STATE_DB = ROOT_DIR / "data" / "hh_auto_apply.sqlite3"
 DEFAULT_COVER_LETTER_PROMPT_PATH = MY_DIR / "cover_letter_prompt.md"
 HH_API_BASE = "https://api.hh.ru"
+DEFAULT_HH_WEB_BASE = "https://rostov.hh.ru"
 DEFAULT_USER_AGENT = "hh-auto-apply/1.0 (contact: set HH_USER_AGENT in .env)"
-HH_API_TIMEOUT_SECONDS = 45
-HH_API_RETRIES = 3
+DEFAULT_HH_API_TIMEOUT_SECONDS = 45
+DEFAULT_HH_API_RETRIES = 3
+DEFAULT_HH_ACCEPT_LANGUAGE = "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+DEFAULT_HH_API_REFERER = "https://hh.ru/"
+DEFAULT_HH_BROWSER_NAV_RETRIES = 3
+DEFAULT_HH_BROWSER_NAV_TIMEOUT_SECONDS = 60
+DEFAULT_LLM_RETRIES = 3
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
 
 HR_ADAPTATION_RULES = """
 Ты — профессиональный HR-консультант и эксперт по резюме. Твоя задача — адаптировать
@@ -127,7 +137,70 @@ def normalize_letter_text(value: str) -> str:
     }
     for source, replacement in replacements.items():
         value = value.replace(source, replacement)
-    return normalize_space(value)
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs = split_letter_paragraphs(value)
+    if not paragraphs:
+        return ""
+    if len(paragraphs) == 1:
+        paragraphs = paragraphize_sentences(paragraphs[0])
+    return "\n\n".join(paragraphs).strip()
+
+
+def split_letter_paragraphs(value: str) -> list[str]:
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for raw_line in value.split("\n"):
+        line = normalize_space(raw_line)
+        if line:
+            current.append(line)
+            continue
+        if current:
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return paragraphs
+
+
+def paragraphize_sentences(value: str) -> list[str]:
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", value) if sentence.strip()]
+    if len(sentences) < 3:
+        return [value]
+    if len(sentences) == 3:
+        return sentences
+    return [sentences[0], " ".join(sentences[1:-1]), sentences[-1]]
+
+
+def validate_letter_policy(letter: str, config: dict[str, Any]) -> None:
+    if "ё" in letter or "Ё" in letter:
+        raise ValueError('Letter contains forbidden "ё" character')
+    if any(char in letter for char in ("—", "–", "−", "‑")):
+        raise ValueError("Letter contains forbidden long dash character")
+
+    forbidden_terms = [
+        str(value).strip()
+        for value in get_nested(config, "letter.forbidden_terms", [])
+        if str(value).strip()
+    ]
+    low_letter = letter.lower()
+    for term in forbidden_terms:
+        if term.lower() in low_letter:
+            raise ValueError(f"Letter contains forbidden term from letter.forbidden_terms: {term}")
+
+    question_config = get_nested(config, "application_questions", {})
+    application_only_values = [
+        str(question_config.get("city") or "").strip(),
+        str(question_config.get("salary_expectations") or "").strip(),
+    ]
+    for item in question_config.get("answers") or []:
+        if isinstance(item, dict):
+            application_only_values.append(str(item.get("answer") or "").strip())
+
+    for value in application_only_values:
+        if value and value.lower() in low_letter:
+            raise ValueError(
+                "Letter contains application question answer that must be used only in explicit question fields"
+            )
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -159,31 +232,143 @@ def hh_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         url = f"{url}?{query}"
 
     last_error: Exception | None = None
-    for attempt in range(1, HH_API_RETRIES + 1):
+    retries = hh_api_retries()
+    timeout = hh_api_timeout_seconds()
+    for attempt in range(1, retries + 1):
         request = urllib.request.Request(
             url,
-            headers={
-                "User-Agent": hh_user_agent(),
-                "Accept": "application/json",
-            },
+            headers=hh_api_headers(),
         )
         try:
-            with urllib.request.urlopen(request, timeout=HH_API_TIMEOUT_SECONDS) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HH API error {exc.code}: {body[:500]}") from exc
         except (TimeoutError, urllib.error.URLError) as exc:
             last_error = exc
-            if attempt < HH_API_RETRIES:
-                print(f"HH API timeout/network error, retry {attempt}/{HH_API_RETRIES}: {url}")
+            if attempt < retries:
+                print(f"HH API timeout/network error, retry {attempt}/{retries}: {url}", flush=True)
                 time.sleep(2 * attempt)
 
-    raise RuntimeError(f"HH API network error after {HH_API_RETRIES} attempts: {last_error}") from last_error
+    raise RuntimeError(f"HH API network error after {retries} attempts: {last_error}") from last_error
 
 
 def hh_user_agent() -> str:
     return os.getenv("HH_USER_AGENT") or DEFAULT_USER_AGENT
+
+
+def hh_browser_user_agent() -> str:
+    return os.getenv("HH_BROWSER_USER_AGENT") or DEFAULT_BROWSER_USER_AGENT
+
+
+def hh_api_headers() -> dict[str, str]:
+    headers = {
+        "User-Agent": hh_browser_user_agent() if hh_browser_headers_enabled() else hh_user_agent(),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": os.getenv("HH_ACCEPT_LANGUAGE") or DEFAULT_HH_ACCEPT_LANGUAGE,
+        "Referer": os.getenv("HH_API_REFERER") or DEFAULT_HH_API_REFERER,
+        "Connection": "close",
+    }
+
+    # Keep the app/contact identifier available when using a browser-like UA.
+    if hh_browser_headers_enabled() and hh_user_agent():
+        headers["HH-User-Agent"] = hh_user_agent()
+
+    return headers
+
+
+def hh_browser_headers_enabled() -> bool:
+    return (os.getenv("HH_BROWSER_HEADERS") or "true").strip().lower() not in ("0", "false", "no")
+
+
+def hh_api_timeout_seconds() -> int:
+    return int(os.getenv("HH_API_TIMEOUT_SECONDS") or DEFAULT_HH_API_TIMEOUT_SECONDS)
+
+
+def hh_api_retries() -> int:
+    return int(os.getenv("HH_API_RETRIES") or DEFAULT_HH_API_RETRIES)
+
+
+def llm_retries() -> int:
+    return int(os.getenv("LLM_RETRIES") or DEFAULT_LLM_RETRIES)
+
+
+def hh_browser_nav_retries() -> int:
+    return int(os.getenv("HH_BROWSER_NAV_RETRIES") or DEFAULT_HH_BROWSER_NAV_RETRIES)
+
+
+def hh_browser_nav_timeout_ms() -> int:
+    seconds = int(os.getenv("HH_BROWSER_NAV_TIMEOUT_SECONDS") or DEFAULT_HH_BROWSER_NAV_TIMEOUT_SECONDS)
+    return seconds * 1000
+
+
+def hh_web_base() -> str:
+    return (os.getenv("HH_WEB_BASE") or DEFAULT_HH_WEB_BASE).rstrip("/")
+
+
+def launch_hh_browser(playwright: Any, headless: bool):
+    options: dict[str, Any] = {
+        "headless": headless,
+        "slow_mo": 250,
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--start-maximized",
+        ],
+    }
+    channel = (os.getenv("HH_BROWSER_CHANNEL") or "").strip()
+    if channel:
+        options["channel"] = channel
+    return playwright.chromium.launch(**options)
+
+
+def new_hh_context(browser: Any, state_path: Path | None = None):
+    options: dict[str, Any] = {
+        "user_agent": hh_browser_user_agent(),
+        "locale": "ru-RU",
+        "timezone_id": os.getenv("TZ") or "Europe/Moscow",
+        "viewport": {"width": 1365, "height": 900},
+        "extra_http_headers": {
+            "Accept-Language": os.getenv("HH_ACCEPT_LANGUAGE") or DEFAULT_HH_ACCEPT_LANGUAGE,
+        },
+    }
+    if state_path is not None and state_path.exists():
+        options["storage_state"] = str(state_path)
+    return browser.new_context(**options)
+
+
+def goto_hh_page(page: Page, url: str, label: str) -> bool:
+    retries = hh_browser_nav_retries()
+    timeout_ms = hh_browser_nav_timeout_ms()
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"Opening hh.ru {label}: attempt {attempt}/{retries}", flush=True)
+            page.goto(url, wait_until="commit", timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=15_000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(1500)
+            if not page_is_browser_error(page):
+                return True
+            print(f"Browser loaded an error page for hh.ru {label}: {page.title()}", flush=True)
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            print(f"Browser {label} page load failed: {exc}", flush=True)
+
+        if attempt < retries:
+            page.wait_for_timeout(2500 * attempt)
+
+    return False
+
+
+def page_is_browser_error(page: Page) -> bool:
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    heading = first_visible_text(page, ["h1"])
+    return browser_error_page(heading, title)
 
 
 def strip_html(value: str) -> str:
@@ -260,6 +445,116 @@ def fetch_vacancy_details(vacancy_id: str) -> dict[str, Any]:
     return hh_get(f"/vacancies/{vacancy_id}")
 
 
+def vacancy_from_details(details: dict[str, Any], query: str = "manual") -> Vacancy:
+    vacancy_id = str(details.get("id") or "")
+    if not vacancy_id:
+        raise ValueError("Vacancy details do not contain id")
+
+    schedule = details.get("schedule") or {}
+    return Vacancy(
+        id=vacancy_id,
+        title=normalize_space(str(details.get("name") or "")),
+        employer=normalize_space(str((details.get("employer") or {}).get("name") or "")) or "Компания",
+        url=str(details.get("alternate_url") or ""),
+        apply_url=str(details.get("apply_alternate_url") or details.get("alternate_url") or ""),
+        description=strip_html(str(details.get("description") or "")),
+        has_test=bool(details.get("has_test")),
+        response_letter_required=bool(details.get("response_letter_required")),
+        query=query,
+        schedule_id=str(schedule.get("id") or ""),
+        schedule_name=str(schedule.get("name") or ""),
+    )
+
+
+def vacancy_from_url(url: str) -> Vacancy:
+    vacancy_id = extract_vacancy_id(url)
+    if not vacancy_id:
+        raise ValueError(f"Could not extract vacancy id from URL: {url}")
+    return vacancy_from_details(fetch_vacancy_details(vacancy_id), query="manual-url")
+
+
+def vacancy_from_url_browser(url: str, headless: bool = False) -> Vacancy:
+    vacancy_id = extract_vacancy_id(url)
+    if not vacancy_id:
+        raise ValueError(f"Could not extract vacancy id from URL: {url}")
+
+    state_path = session_file()
+    with sync_playwright() as p:
+        browser = launch_hh_browser(p, headless=headless)
+        context = new_hh_context(browser, state_path)
+        page = context.new_page()
+        try:
+            if not goto_hh_page(page, url, "vacancy"):
+                raise RuntimeError(f"Browser could not load hh.ru vacancy page: {url}")
+            page.wait_for_timeout(1500)
+            title = first_visible_text(page, ["[data-qa='vacancy-title']", "h1"]) or f"Vacancy {vacancy_id}"
+            employer = (
+                first_visible_text(
+                    page,
+                    [
+                        "[data-qa='vacancy-company-name']",
+                        "[data-qa='vacancy-company-name'] a",
+                        "[data-qa='bloko-header-2']",
+                    ],
+                )
+                or "Компания"
+            )
+            description, _ = get_vacancy_description_browser(page, url)
+            page_title = page.title()
+            if browser_error_page(title, page_title) or (title == f"Vacancy {vacancy_id}" and not description):
+                raise RuntimeError(f"Browser could not load hh.ru vacancy page: {url}")
+            return Vacancy(
+                id=vacancy_id,
+                title=title,
+                employer=employer,
+                url=url,
+                apply_url=url,
+                description=description,
+                has_test=False,
+                response_letter_required=False,
+                query="manual-url-browser",
+                schedule_id="",
+                schedule_name="",
+            )
+        finally:
+            context.close()
+            browser.close()
+
+
+def first_visible_text(page: Page, selectors: list[str]) -> str:
+    for selector in selectors:
+        locator = page.locator(selector).first
+        try:
+            if locator.count() > 0 and locator.is_visible(timeout=1000):
+                return normalize_space(locator.inner_text(timeout=1000))
+        except Exception:
+            continue
+    return ""
+
+
+def browser_error_page(title: str, page_title: str) -> bool:
+    combined = f"{title} {page_title}".lower()
+    error_markers = [
+        "this site can't be reached",
+        "this site can’t be reached",
+        "не удается получить доступ",
+        "не удаётся получить доступ",
+        "err_timed_out",
+        "err_connection",
+    ]
+    return any(marker in combined for marker in error_markers)
+
+
+def load_manual_vacancy(url: str, allow_browser_fallback: bool, headless: bool) -> Vacancy:
+    try:
+        return vacancy_from_url(url)
+    except RuntimeError:
+        if not allow_browser_fallback:
+            raise
+        print("HH API vacancy fetch failed. Falling back to browser vacancy page...", flush=True)
+        return vacancy_from_url_browser(url, headless=headless)
+
+
 def vacancy_passes_filters(
     config: dict[str, Any],
     title: str,
@@ -284,18 +579,24 @@ def vacancy_passes_filters(
     return True
 
 
-def search_vacancies(config: dict[str, Any], conn: sqlite3.Connection | None = None) -> list[Vacancy]:
+def search_vacancies(
+    config: dict[str, Any],
+    conn: sqlite3.Connection | None = None,
+    allow_browser_fallback: bool = True,
+) -> list[Vacancy]:
     try:
         return search_vacancies_api(config)
     except RuntimeError as exc:
+        if not allow_browser_fallback:
+            raise
         print(f"HH API search failed: {exc}")
         print("Falling back to hh.ru browser search...")
         state_path = session_file()
         if not state_path.exists():
             raise RuntimeError(f"HH session not found: {state_path}. Run python3 hh_login.py") from exc
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False, slow_mo=250)
-            context = browser.new_context(storage_state=str(state_path))
+            browser = launch_hh_browser(p, headless=False)
+            context = new_hh_context(browser, state_path)
             page = context.new_page()
             try:
                 return search_vacancies_browser(page, config, conn)
@@ -323,6 +624,7 @@ def search_vacancies_api(config: dict[str, Any]) -> list[Vacancy]:
             continue
 
         for page_num in range(max_pages):
+            print(f"Searching hh.ru API: {query} (page {page_num + 1}/{max_pages})", flush=True)
             response = hh_get(
                 "/vacancies",
                 {
@@ -352,6 +654,7 @@ def search_vacancies_api(config: dict[str, Any]) -> list[Vacancy]:
                 schedule = details.get("schedule") or item.get("schedule") or {}
                 schedule_id = str(schedule.get("id") or "")
                 schedule_name = str(schedule.get("name") or "")
+                vacancy = vacancy_from_details(details, query=query)
 
                 if not vacancy_passes_filters(
                     config,
@@ -363,30 +666,7 @@ def search_vacancies_api(config: dict[str, Any]) -> list[Vacancy]:
                 ):
                     continue
 
-                results.append(
-                    Vacancy(
-                        id=vacancy_id,
-                        title=title,
-                        employer=employer or "Компания",
-                        url=str(details.get("alternate_url") or item.get("alternate_url") or ""),
-                        apply_url=str(
-                            details.get("apply_alternate_url")
-                            or item.get("apply_alternate_url")
-                            or details.get("alternate_url")
-                            or item.get("alternate_url")
-                            or ""
-                        ),
-                        description=description,
-                        has_test=bool(details.get("has_test") or item.get("has_test")),
-                        response_letter_required=bool(
-                            details.get("response_letter_required")
-                            or item.get("response_letter_required")
-                        ),
-                        query=query,
-                        schedule_id=schedule_id,
-                        schedule_name=schedule_name,
-                    )
-                )
+                results.append(vacancy)
 
     return results
 
@@ -420,12 +700,10 @@ def search_vacancies_browser(
             if remote_only_enabled(config):
                 params["schedule"] = "remote"
 
-            url = "https://hh.ru/search/vacancy?" + urllib.parse.urlencode(params)
-            try:
-                page.goto(url, wait_until="commit", timeout=90_000)
-                page.wait_for_load_state("domcontentloaded", timeout=20_000)
-            except PlaywrightTimeoutError:
-                print(f"Browser search page load timeout, trying to parse current page: {url}")
+            url = f"{hh_web_base()}/search/vacancy?" + urllib.parse.urlencode(params)
+            if not goto_hh_page(page, url, "search"):
+                print(f"Skipping browser search page after load failures: {url}", flush=True)
+                continue
             page.wait_for_timeout(2000)
 
             if "captcha" in page.title().lower() or page.locator("text=Капча").count() > 0:
@@ -523,7 +801,8 @@ def extract_vacancy_id(url: str) -> str:
 
 def get_vacancy_description_browser(page: Page, url: str) -> tuple[str, bool]:
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        if not goto_hh_page(page, url, "vacancy details"):
+            return "", False
         page.wait_for_timeout(1000)
         already_responded = page_has_existing_response(page)
         page.wait_for_selector("[data-qa='vacancy-description']", timeout=10_000)
@@ -693,6 +972,7 @@ def build_cover_letter_prompt(
 
 Требования к письму:
 - 3-5 предложений.
+- 3 абзаца, пустая строка между абзацами.
 - Максимум {max_chars} символов.
 - Не начинай с "Меня заинтересовала вакансия".
 - Не пиши общими словами "имею большой опыт", если можно назвать стек, домен или задачу.
@@ -708,6 +988,14 @@ def build_cover_letter_prompt(
         user += f"\n- Можно аккуратно добавить ссылку на портфолио: {portfolio_url}\n"
     if extra_instructions:
         user += f"\nДополнительные инструкции:\n{extra_instructions}\n"
+
+    user += """
+
+Жесткое ограничение:
+- Не указывай в сопроводительном письме город, формат работы и зарплатные ожидания.
+- Не добавляй ответы из application_questions в текст письма.
+- Эти данные заполняются только в отдельных вопросах работодателя, если такие поля есть на форме отклика.
+"""
 
     return system, user, max_chars
 
@@ -739,7 +1027,9 @@ def generate_cover_letter(
     config: dict[str, Any],
 ) -> str:
     if llm.provider == "none":
-        return normalize_letter_text(generate_fallback_letter(vacancy))
+        letter = normalize_letter_text(generate_fallback_letter(vacancy))
+        validate_letter_policy(letter, config)
+        return letter
 
     system, user, max_chars = build_cover_letter_prompt(profile, vacancy, config)
     if llm.provider == "openai":
@@ -748,7 +1038,9 @@ def generate_cover_letter(
         letter = generate_anthropic_letter(llm, system, user)
     else:
         raise RuntimeError(f"Unsupported LLM provider: {llm.provider}")
-    return normalize_letter_text(letter)[:max_chars].strip()
+    letter = normalize_letter_text(letter)[:max_chars].strip()
+    validate_letter_policy(letter, config)
+    return letter
 
 
 def generate_fallback_letter(vacancy: Vacancy) -> str:
@@ -968,12 +1260,20 @@ def save_apply_debug(page: Page, vacancy_id: str) -> str:
     return str(base)
 
 
-def apply_to_vacancy(page: Page, vacancy: Vacancy, letter: str, config: dict[str, Any]) -> tuple[str, str]:
+def apply_to_vacancy(
+    page: Page,
+    vacancy: Vacancy,
+    letter: str,
+    config: dict[str, Any],
+    confirm_before_submit: bool = False,
+) -> tuple[str, str]:
     target_url = vacancy.url or vacancy.apply_url
     if not target_url:
         return "error", "No apply URL"
 
-    page.goto(target_url, wait_until="domcontentloaded", timeout=30_000)
+    if not goto_hh_page(page, target_url, "apply"):
+        debug_base = save_apply_debug(page, vacancy.id)
+        return "error", f"Could not load vacancy apply page; debug saved: {debug_base}"
     page.wait_for_timeout(1500)
 
     if page_has_existing_response(page):
@@ -1021,6 +1321,17 @@ def apply_to_vacancy(page: Page, vacancy: Vacancy, letter: str, config: dict[str
     for filled in filled_questions:
         print(f"Filled application question: {filled}")
 
+    if confirm_before_submit:
+        if not sys.stdin.isatty():
+            debug_base = save_apply_debug(page, vacancy.id)
+            return "error", f"Cannot confirm submit without TTY; debug saved: {debug_base}"
+        print("\nReady to send real hh.ru response.")
+        print(f"Vacancy: {vacancy.title} | {vacancy.employer}")
+        print(f"URL: {vacancy.url or vacancy.apply_url}")
+        answer = input('Type "send" to click the final submit button, anything else to skip: ').strip()
+        if answer != "send":
+            return "cancelled", "User skipped before final submit"
+
     clicked = click_first(
         page,
         [
@@ -1058,7 +1369,16 @@ def run_once(config: dict[str, Any], args: argparse.Namespace) -> None:
         state_db = ROOT_DIR / state_db
     conn = init_db(state_db)
     profile = load_profile()
-    vacancies = search_vacancies(config, conn)
+    if args.vacancy_url:
+        vacancies = [
+            load_manual_vacancy(
+                args.vacancy_url,
+                allow_browser_fallback=not args.no_browser_fallback,
+                headless=bool(args.headless),
+            )
+        ]
+    else:
+        vacancies = search_vacancies(config, conn, allow_browser_fallback=not args.no_browser_fallback)
     limits = get_nested(config, "limits", {})
     max_per_run = int(args.max_applications or limits.get("max_applications_per_run", 5))
     delay = int(limits.get("delay_between_applications_seconds", 12))
@@ -1082,8 +1402,8 @@ def run_once(config: dict[str, Any], args: argparse.Namespace) -> None:
             if not state_path.exists():
                 raise RuntimeError(f"HH session not found: {state_path}. Run python3 hh_login.py")
             playwright = sync_playwright().start()
-            browser = playwright.chromium.launch(headless=bool(args.headless), slow_mo=250)
-            browser_context = browser.new_context(storage_state=str(state_path))
+            browser = launch_hh_browser(playwright, headless=bool(args.headless))
+            browser_context = new_hh_context(browser, state_path)
             page = browser_context.new_page()
 
         for vacancy in vacancies:
@@ -1113,7 +1433,13 @@ def run_once(config: dict[str, Any], args: argparse.Namespace) -> None:
 
             if args.apply:
                 assert page is not None
-                status, reason = apply_to_vacancy(page, vacancy, letter, config)
+                status, reason = apply_to_vacancy(
+                    page,
+                    vacancy,
+                    letter,
+                    config,
+                    confirm_before_submit=bool(args.confirm_submit),
+                )
                 record_result(conn, vacancy, status, reason, letter)
                 print(f"Result: {status} ({reason})")
                 time.sleep(delay)
@@ -1168,6 +1494,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--apply", action="store_true", help="Actually send responses. Default is dry-run.")
     parser.add_argument("--headless", action="store_true", help="Run browser headless in --apply mode")
     parser.add_argument("--max-applications", type=int, default=None)
+    parser.add_argument("--vacancy-url", default="", help="Process one exact hh.ru vacancy URL instead of search")
+    parser.add_argument(
+        "--no-browser-fallback",
+        action="store_true",
+        help="Fail on HH API search errors instead of opening browser fallback",
+    )
+    parser.add_argument(
+        "--confirm-submit",
+        action="store_true",
+        help='In --apply mode, pause before final submit and require typing "send"',
+    )
     return parser.parse_args()
 
 
@@ -1190,9 +1527,17 @@ def main() -> int:
         args.once = True
 
     if args.schedule:
-        run_schedule(config, args)
+        try:
+            run_schedule(config, args)
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
     else:
-        run_once(config, args)
+        try:
+            run_once(config, args)
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
 
     return 0
 

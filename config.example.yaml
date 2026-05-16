@@ -74,6 +74,9 @@ letter:
   language: ru
   max_chars: 1200
   portfolio_url: ""
+  # Optional hard blocklist. Put past company names here in your private my/config.yaml
+  # if you want the script to skip sending a letter when the LLM mentions them.
+  forbidden_terms: []
   # Optional editable prompt file. If missing, built-in defaults are used.
   prompt_path: my/cover_letter_prompt.md
   extra_instructions: |
