@@ -34,6 +34,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 MY_DIR = ROOT_DIR / "my"
 DEFAULT_CONFIG_PATH = MY_DIR / "config.yaml"
 DEFAULT_STATE_DB = ROOT_DIR / "data" / "hh_auto_apply.sqlite3"
+SKIPPED_LOG_PATH = ROOT_DIR / "data" / "skipped_vacancies.txt"
 DEFAULT_COVER_LETTER_PROMPT_PATH = MY_DIR / "cover_letter_prompt.md"
 HH_API_BASE = "https://api.hh.ru"
 DEFAULT_HH_WEB_BASE = "https://rostov.hh.ru"
@@ -600,7 +601,7 @@ def search_vacancies(
     headless: bool = False,
 ) -> list[Vacancy]:
     try:
-        return search_vacancies_api(config)
+        return search_vacancies_api(config, conn)
     except RuntimeError as exc:
         if not allow_browser_fallback:
             raise
@@ -620,7 +621,10 @@ def search_vacancies(
                 browser.close()
 
 
-def search_vacancies_api(config: dict[str, Any]) -> list[Vacancy]:
+def search_vacancies_api(
+    config: dict[str, Any],
+    conn: sqlite3.Connection | None = None,
+) -> list[Vacancy]:
     search_config = get_nested(config, "search", {})
     queries = vacancy_keywords(config)
     if not queries:
@@ -662,8 +666,33 @@ def search_vacancies_api(config: dict[str, Any]) -> list[Vacancy]:
 
                 item_title = normalize_space(str(item.get("name") or ""))
                 item_employer = normalize_space(str((item.get("employer") or {}).get("name") or ""))
+                item_url = normalize_space(str(item.get("alternate_url") or ""))
                 item_schedule_id = str((item.get("schedule") or {}).get("id") or "")
                 item_has_test = bool(item.get("has_test"))
+
+                stop_match = keyword_match(item_title, vacancy_stop_words(config))
+                if stop_match:
+                    if conn is not None:
+                        record_result(
+                            conn,
+                            Vacancy(
+                                id=vacancy_id,
+                                title=item_title,
+                                employer=item_employer or "Компания",
+                                url=item_url,
+                                apply_url=item_url,
+                                description="",
+                                has_test=item_has_test,
+                                response_letter_required=False,
+                                query=query,
+                                schedule_id=item_schedule_id,
+                                schedule_name="",
+                            ),
+                            "skipped",
+                            f"Stop word in title: {stop_match}",
+                            "",
+                        )
+                    continue
 
                 # Cheap pre-filter using search response fields, so we skip the
                 # per-vacancy details fetch for vacancies that already lose on
@@ -758,6 +787,29 @@ def search_vacancies_browser(
                     continue
 
             for vacancy_id, title, employer, vacancy_url in candidates:
+                stop_match = keyword_match(title, vacancy_stop_words(config))
+                if stop_match:
+                    if conn is not None:
+                        record_result(
+                            conn,
+                            Vacancy(
+                                id=vacancy_id,
+                                title=title,
+                                employer=employer or "Компания",
+                                url=vacancy_url,
+                                apply_url=vacancy_url,
+                                description="",
+                                has_test=False,
+                                response_letter_required=False,
+                                query=query,
+                                schedule_id="remote" if remote_only_enabled(config) else "",
+                                schedule_name="Удаленная работа" if remote_only_enabled(config) else "",
+                            ),
+                            "skipped",
+                            f"Stop word in title: {stop_match}",
+                            "",
+                        )
+                    continue
                 description, already_responded = get_vacancy_description_browser(page, vacancy_url)
                 if already_responded:
                     print(f"Skipping already responded vacancy: {title}")
@@ -872,6 +924,17 @@ def already_processed(conn: sqlite3.Connection, vacancy_id: str, include_dry_run
     return row is not None
 
 
+def append_skipped_log(vacancy: Vacancy, reason: str) -> None:
+    SKIPPED_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ts = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    line = (
+        f"[{ts}] {reason} | {vacancy.title} | {vacancy.employer} | "
+        f"{vacancy.url or vacancy.apply_url}\n"
+    )
+    with SKIPPED_LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
 def record_result(
     conn: sqlite3.Connection,
     vacancy: Vacancy,
@@ -879,6 +942,8 @@ def record_result(
     reason: str,
     letter: str,
 ) -> None:
+    if status == "skipped":
+        append_skipped_log(vacancy, reason)
     conn.execute(
         """
         INSERT INTO vacancy_runs (
@@ -1151,10 +1216,11 @@ def generate_anthropic_letter(llm: LlmConfig, system: str, user: str) -> str:
     )
 
     client = Anthropic(api_key=llm.api_key)
+    retryable = (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)
 
-    def call():
+    def call(model: str) -> str:
         response = client.messages.create(
-            model=llm.model,
+            model=model,
             system=system,
             messages=[{"role": "user", "content": user}],
             max_tokens=450,
@@ -1166,11 +1232,27 @@ def generate_anthropic_letter(llm: LlmConfig, system: str, user: str) -> str:
                 chunks.append(getattr(block, "text", ""))
         return "".join(chunks).strip()
 
-    return _llm_call_with_retries(
-        call,
-        (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError),
-        "Anthropic letter generation",
-    )
+    try:
+        return _llm_call_with_retries(
+            lambda: call(llm.model),
+            retryable,
+            f"Anthropic letter generation ({llm.model})",
+        )
+    except RuntimeError as primary_exc:
+        fallback = (os.getenv("ANTHROPIC_FALLBACK_MODEL") or "").strip()
+        if not fallback or fallback == llm.model:
+            raise
+        print(
+            f"Anthropic primary model {llm.model} exhausted, trying fallback {fallback} (one attempt)",
+            flush=True,
+        )
+        try:
+            return call(fallback)
+        except retryable as fb_exc:
+            raise RuntimeError(
+                f"Anthropic letter generation failed on primary {llm.model} "
+                f"and fallback {fallback}: {fb_exc}"
+            ) from fb_exc
 
 
 def locator_context_text(locator) -> str:
@@ -1418,7 +1500,10 @@ def apply_to_vacancy(
         clicked = click_first_enabled_button(page, ["Откликнуться", "Отправить"], timeout_ms=2500)
     if not clicked:
         debug_base = save_apply_debug(page, vacancy.id)
-        return "error", f"Final submit button not found; debug saved: {debug_base}"
+        return (
+            "skipped",
+            f"Submit button unavailable (extra form); debug saved: {debug_base}",
+        )
 
     for _ in range(10):
         page.wait_for_timeout(1000)
@@ -1483,7 +1568,7 @@ def run_once(config: dict[str, Any], args: argparse.Namespace) -> None:
             page = browser_context.new_page()
 
         for vacancy in vacancies:
-            if sent_or_planned >= max_per_run:
+            if max_per_run > 0 and sent_or_planned >= max_per_run:
                 break
             if skip_already_applied_enabled(config) and already_processed(
                 conn,
