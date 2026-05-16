@@ -50,6 +50,7 @@ HR_ADAPTATION_RULES = """
 - Релевантность: содержание должно соответствовать требованиям вакансии.
 - Правдивость: не преувеличивай опыт и навыки.
 - Деловой стиль: исключи юмор, сленг и восклицательные знаки.
+- Не используй букву "е" с точками, длинные тире и типографские тире.
 
 Алгоритм адаптации:
 - Сопоставь желаемую роль кандидата с названием вакансии.
@@ -59,6 +60,7 @@ HR_ADAPTATION_RULES = """
 - Используй цифры и результаты только если они есть в оригинальном профиле.
 
 Не включай:
+- Названия прошлых компаний кандидата.
 - Семейное положение и возраст.
 - Хобби, если они не связаны с работой.
 - Очевидные навыки вроде MS Office или "уверенный пользователь ПК".
@@ -70,6 +72,7 @@ HR_ADAPTATION_RULES = """
 - Строго запрещено придумывать метрики и цифры.
 - Используй только информацию из профиля кандидата и вакансии.
 - Можно перефразировать и реструктурировать, но нельзя добавлять несуществующие данные.
+- Нельзя использовать названия прошлых компаний кандидата в письме.
 """.strip()
 
 
@@ -111,6 +114,20 @@ class LlmConfig:
 
 def normalize_space(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_letter_text(value: str) -> str:
+    replacements = {
+        "ё": "е",
+        "Ё": "Е",
+        "—": "-",
+        "–": "-",
+        "−": "-",
+        "‑": "-",
+    }
+    for source, replacement in replacements.items():
+        value = value.replace(source, replacement)
+    return normalize_space(value)
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -722,7 +739,7 @@ def generate_cover_letter(
     config: dict[str, Any],
 ) -> str:
     if llm.provider == "none":
-        return generate_fallback_letter(vacancy)
+        return normalize_letter_text(generate_fallback_letter(vacancy))
 
     system, user, max_chars = build_cover_letter_prompt(profile, vacancy, config)
     if llm.provider == "openai":
@@ -731,7 +748,7 @@ def generate_cover_letter(
         letter = generate_anthropic_letter(llm, system, user)
     else:
         raise RuntimeError(f"Unsupported LLM provider: {llm.provider}")
-    return letter[:max_chars].strip()
+    return normalize_letter_text(letter)[:max_chars].strip()
 
 
 def generate_fallback_letter(vacancy: Vacancy) -> str:
@@ -793,16 +810,116 @@ def generate_anthropic_letter(llm: LlmConfig, system: str, user: str) -> str:
     return "".join(chunks).strip()
 
 
-def find_first_visible_textarea(page: Page):
+def locator_context_text(locator) -> str:
+    try:
+        return normalize_space(
+            locator.evaluate(
+                """element => {
+                    let node = element;
+                    const parts = [];
+                    for (let i = 0; i < 5 && node; i += 1) {
+                        if (node.innerText) parts.push(node.innerText);
+                        node = node.parentElement;
+                    }
+                    return parts.join(' ');
+                }"""
+            )
+        )
+    except Exception:
+        return ""
+
+
+def locator_value(locator) -> str:
+    try:
+        value = locator.input_value(timeout=500)
+        return value or ""
+    except Exception:
+        return ""
+
+
+def visible_textareas(page: Page):
+    result = []
     textareas = page.locator("textarea")
     for index in range(textareas.count()):
         textarea = textareas.nth(index)
         try:
             if textarea.is_visible(timeout=500):
-                return textarea
-        except PlaywrightTimeoutError:
+                result.append(textarea)
+        except Exception:
             continue
+    return result
+
+
+def find_cover_letter_textarea(page: Page):
+    textareas = visible_textareas(page)
+    for textarea in textareas:
+        context = locator_context_text(textarea).lower()
+        try:
+            placeholder = (textarea.get_attribute("placeholder") or "").lower()
+        except Exception:
+            placeholder = ""
+        combined = f"{context} {placeholder}"
+        if "сопровод" in combined or "письм" in combined:
+            return textarea
+    if len(textareas) == 1:
+        context = locator_context_text(textareas[0]).lower()
+        if not any(word in context for word in ("город", "зарплат", "зп", "ожидания", "доход")):
+            return textareas[0]
     return None
+
+
+def configured_question_answers(config: dict[str, Any]) -> list[dict[str, Any]]:
+    question_config = get_nested(config, "application_questions", {})
+    answers = list(question_config.get("answers") or [])
+    city = str(question_config.get("city") or "").strip()
+    salary = str(question_config.get("salary_expectations") or "").strip()
+    if city:
+        answers.append({"keywords": ["город", "откуда", "проживаете"], "answer": city})
+    if salary:
+        answers.append(
+            {
+                "keywords": ["зарплат", "зп", "ожидания", "доход", "компенсац"],
+                "answer": salary,
+            }
+        )
+    return answers
+
+
+def answer_for_question(question_text: str, config: dict[str, Any]) -> str:
+    normalized = question_text.lower()
+    for item in configured_question_answers(config):
+        keywords = [str(keyword).lower() for keyword in item.get("keywords") or []]
+        if keywords and any(keyword in normalized for keyword in keywords):
+            return str(item.get("answer") or "").strip()
+    return ""
+
+
+def fill_application_questions(page: Page, config: dict[str, Any]) -> list[str]:
+    filled: list[str] = []
+    fields = []
+    for selector in ["textarea", "input[type='text']", "input:not([type])"]:
+        locators = page.locator(selector)
+        for index in range(locators.count()):
+            field = locators.nth(index)
+            try:
+                if field.is_visible(timeout=500) and field.is_enabled(timeout=500):
+                    fields.append(field)
+            except Exception:
+                continue
+
+    for field in fields:
+        if locator_value(field).strip():
+            continue
+        context = locator_context_text(field)
+        answer = answer_for_question(context, config)
+        if not answer:
+            continue
+        try:
+            field.fill(answer)
+            filled.append(f"{context[:80]} -> {answer}")
+        except Exception:
+            continue
+    return filled
 
 
 def click_first(page: Page, selectors: list[str], timeout_ms: int = 1500) -> bool:
@@ -817,8 +934,42 @@ def click_first(page: Page, selectors: list[str], timeout_ms: int = 1500) -> boo
     return False
 
 
-def apply_to_vacancy(page: Page, vacancy: Vacancy, letter: str) -> tuple[str, str]:
-    target_url = vacancy.apply_url or vacancy.url
+def click_first_enabled_button(page: Page, button_texts: list[str], timeout_ms: int = 1500) -> bool:
+    for text in button_texts:
+        buttons = page.locator(f"button:has-text('{text}')")
+        try:
+            count = buttons.count()
+        except Exception:
+            continue
+        for index in range(count - 1, -1, -1):
+            button = buttons.nth(index)
+            try:
+                if button.is_visible(timeout=timeout_ms) and button.is_enabled(timeout=timeout_ms):
+                    button.click()
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def save_apply_debug(page: Page, vacancy_id: str) -> str:
+    debug_dir = ROOT_DIR / "data" / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = debug_dir / f"apply-{vacancy_id}-{stamp}"
+    try:
+        page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+    except Exception:
+        pass
+    try:
+        base.with_suffix(".html").write_text(page.content(), encoding="utf-8")
+    except Exception:
+        pass
+    return str(base)
+
+
+def apply_to_vacancy(page: Page, vacancy: Vacancy, letter: str, config: dict[str, Any]) -> tuple[str, str]:
+    target_url = vacancy.url or vacancy.apply_url
     if not target_url:
         return "error", "No apply URL"
 
@@ -828,48 +979,72 @@ def apply_to_vacancy(page: Page, vacancy: Vacancy, letter: str) -> tuple[str, st
     if page_has_existing_response(page):
         return "skipped", "Already responded"
 
-    textarea = find_first_visible_textarea(page)
-    if textarea is None:
+    clicked_initial = click_first(
+        page,
+        [
+            "[data-qa='vacancy-response-link-top']",
+            "[data-qa='vacancy-response-link-bottom']",
+            "a:has-text('Откликнуться')",
+            "button:has-text('Откликнуться')",
+        ],
+        timeout_ms=3000,
+    )
+    if not clicked_initial:
+        return "error", "Initial response button not found"
+
+    page.wait_for_timeout(2500)
+    if page_has_existing_response(page):
+        return "success", "Response sent"
+
+    cover_letter_area = find_cover_letter_textarea(page)
+    if cover_letter_area is None:
         click_first(
             page,
             [
                 "a:has-text('Написать сопроводительное')",
+                "button:has-text('Написать сопроводительное')",
+                "a:has-text('Добавить сопроводительное')",
+                "button:has-text('Добавить сопроводительное')",
                 "button:has-text('С сопроводительным')",
                 "text=С сопроводительным",
                 "[data-qa='vacancy-response-actions-dropdown']",
             ],
         )
-        page.wait_for_timeout(1000)
-        textarea = find_first_visible_textarea(page)
+        page.wait_for_timeout(1500)
+        cover_letter_area = find_cover_letter_textarea(page)
 
-    if textarea is not None:
-        textarea.fill(letter)
+    if cover_letter_area is not None:
+        cover_letter_area.fill(letter)
         page.wait_for_timeout(500)
+
+    filled_questions = fill_application_questions(page, config)
+    for filled in filled_questions:
+        print(f"Filled application question: {filled}")
 
     clicked = click_first(
         page,
         [
             "button[data-qa='vacancy-response-submit-popup']",
+            "button[data-qa='vacancy-response-submit']",
             "button:has-text('Отправить')",
-            "button:has-text('Откликнуться')",
+            "button:has-text('Отправить отклик')",
             "button[type='submit']",
-            "[data-qa='vacancy-response-link-top']",
-            "[data-qa='vacancy-response-link-bottom']",
         ],
         timeout_ms=2500,
     )
     if not clicked:
-        return "error", "Submit button not found"
+        clicked = click_first_enabled_button(page, ["Откликнуться", "Отправить"], timeout_ms=2500)
+    if not clicked:
+        debug_base = save_apply_debug(page, vacancy.id)
+        return "error", f"Final submit button not found; debug saved: {debug_base}"
 
-    page.wait_for_timeout(2500)
-    if (
-        page.locator("text=Вы откликнулись").count() > 0
-        or page.locator("text=Резюме доставлено").count() > 0
-        or page.locator("text=Отклик отправлен").count() > 0
-    ):
-        return "success", "Response sent"
+    for _ in range(10):
+        page.wait_for_timeout(1000)
+        if page_has_existing_response(page):
+            return "success", "Response sent"
 
-    return "success", "Clicked submit, final status unclear"
+    debug_base = save_apply_debug(page, vacancy.id)
+    return "error", f"Submit clicked but hh.ru did not confirm response; debug saved: {debug_base}"
 
 
 def session_file() -> Path:
@@ -938,7 +1113,7 @@ def run_once(config: dict[str, Any], args: argparse.Namespace) -> None:
 
             if args.apply:
                 assert page is not None
-                status, reason = apply_to_vacancy(page, vacancy, letter)
+                status, reason = apply_to_vacancy(page, vacancy, letter, config)
                 record_result(conn, vacancy, status, reason, letter)
                 print(f"Result: {status} ({reason})")
                 time.sleep(delay)
