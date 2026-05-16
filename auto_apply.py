@@ -49,6 +49,7 @@ DEFAULT_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 )
+RETRYABLE_HH_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
 
 HR_ADAPTATION_RULES = """
 Ты — профессиональный HR-консультант и эксперт по резюме. Твоя задача — адаптировать
@@ -243,6 +244,19 @@ def hh_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            if exc.code in RETRYABLE_HH_HTTP_CODES and attempt < retries:
+                last_error = exc
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                if retry_after and retry_after.isdigit():
+                    wait_seconds = max(1, int(retry_after))
+                else:
+                    wait_seconds = 2 * attempt
+                print(
+                    f"HH API {exc.code}, retry {attempt}/{retries} after {wait_seconds}s: {url}",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+                continue
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"HH API error {exc.code}: {body[:500]}") from exc
         except (TimeoutError, urllib.error.URLError) as exc:
@@ -583,6 +597,7 @@ def search_vacancies(
     config: dict[str, Any],
     conn: sqlite3.Connection | None = None,
     allow_browser_fallback: bool = True,
+    headless: bool = False,
 ) -> list[Vacancy]:
     try:
         return search_vacancies_api(config)
@@ -595,7 +610,7 @@ def search_vacancies(
         if not state_path.exists():
             raise RuntimeError(f"HH session not found: {state_path}. Run python3 hh_login.py") from exc
         with sync_playwright() as p:
-            browser = launch_hh_browser(p, headless=False)
+            browser = launch_hh_browser(p, headless=headless)
             context = new_hh_context(browser, state_path)
             page = context.new_page()
             try:
@@ -645,24 +660,34 @@ def search_vacancies_api(config: dict[str, Any]) -> list[Vacancy]:
                     continue
                 seen_ids.add(vacancy_id)
 
+                item_title = normalize_space(str(item.get("name") or ""))
+                item_employer = normalize_space(str((item.get("employer") or {}).get("name") or ""))
+                item_schedule_id = str((item.get("schedule") or {}).get("id") or "")
+                item_has_test = bool(item.get("has_test"))
+
+                # Cheap pre-filter using search response fields, so we skip the
+                # per-vacancy details fetch for vacancies that already lose on
+                # title/employer/schedule/has_test.
+                if not vacancy_passes_filters(
+                    config,
+                    title=item_title,
+                    employer=item_employer,
+                    description="",
+                    schedule_id=item_schedule_id,
+                    has_test=item_has_test,
+                ):
+                    continue
+
                 details = fetch_vacancy_details(vacancy_id)
-                title = normalize_space(str(details.get("name") or item.get("name") or ""))
-                employer = normalize_space(
-                    str((details.get("employer") or item.get("employer") or {}).get("name") or "")
-                )
-                description = strip_html(str(details.get("description") or ""))
-                schedule = details.get("schedule") or item.get("schedule") or {}
-                schedule_id = str(schedule.get("id") or "")
-                schedule_name = str(schedule.get("name") or "")
                 vacancy = vacancy_from_details(details, query=query)
 
                 if not vacancy_passes_filters(
                     config,
-                    title=title,
-                    employer=employer,
-                    description=description,
-                    schedule_id=schedule_id,
-                    has_test=bool(details.get("has_test") or item.get("has_test")),
+                    title=vacancy.title,
+                    employer=vacancy.employer,
+                    description=vacancy.description,
+                    schedule_id=vacancy.schedule_id or item_schedule_id,
+                    has_test=vacancy.has_test,
                 ):
                     continue
 
@@ -1068,38 +1093,84 @@ def generate_fallback_letter(vacancy: Vacancy) -> str:
     )
 
 
+def _llm_call_with_retries(call, retryable_exceptions: tuple, label: str):
+    retries = llm_retries()
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return call()
+        except retryable_exceptions as exc:
+            last_error = exc
+            if attempt < retries:
+                wait_seconds = 2 ** attempt
+                print(
+                    f"{label} transient error, retry {attempt}/{retries} after {wait_seconds}s: {exc}",
+                    flush=True,
+                )
+                time.sleep(wait_seconds)
+    raise RuntimeError(f"{label} failed after {retries} attempts: {last_error}") from last_error
+
+
 def generate_openai_letter(llm: LlmConfig, system: str, user: str) -> str:
-    from openai import OpenAI
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        OpenAI,
+        RateLimitError,
+    )
 
     client = OpenAI(api_key=llm.api_key)
-    response = client.chat.completions.create(
-        model=llm.model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.5,
-        max_tokens=450,
+
+    def call():
+        response = client.chat.completions.create(
+            model=llm.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.5,
+            max_tokens=450,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    return _llm_call_with_retries(
+        call,
+        (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError),
+        "OpenAI letter generation",
     )
-    return (response.choices[0].message.content or "").strip()
 
 
 def generate_anthropic_letter(llm: LlmConfig, system: str, user: str) -> str:
-    from anthropic import Anthropic
+    from anthropic import (
+        Anthropic,
+        APIConnectionError,
+        APITimeoutError,
+        InternalServerError,
+        RateLimitError,
+    )
 
     client = Anthropic(api_key=llm.api_key)
-    response = client.messages.create(
-        model=llm.model,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-        max_tokens=450,
-        temperature=0.5,
+
+    def call():
+        response = client.messages.create(
+            model=llm.model,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            max_tokens=450,
+            temperature=0.5,
+        )
+        chunks: list[str] = []
+        for block in response.content:
+            if getattr(block, "type", None) == "text":
+                chunks.append(getattr(block, "text", ""))
+        return "".join(chunks).strip()
+
+    return _llm_call_with_retries(
+        call,
+        (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError),
+        "Anthropic letter generation",
     )
-    chunks: list[str] = []
-    for block in response.content:
-        if getattr(block, "type", None) == "text":
-            chunks.append(getattr(block, "text", ""))
-    return "".join(chunks).strip()
 
 
 def locator_context_text(locator) -> str:
@@ -1378,7 +1449,12 @@ def run_once(config: dict[str, Any], args: argparse.Namespace) -> None:
             )
         ]
     else:
-        vacancies = search_vacancies(config, conn, allow_browser_fallback=not args.no_browser_fallback)
+        vacancies = search_vacancies(
+            config,
+            conn,
+            allow_browser_fallback=not args.no_browser_fallback,
+            headless=bool(args.headless),
+        )
     limits = get_nested(config, "limits", {})
     max_per_run = int(args.max_applications or limits.get("max_applications_per_run", 5))
     delay = int(limits.get("delay_between_applications_seconds", 12))
@@ -1482,7 +1558,12 @@ def run_schedule(config: dict[str, Any], args: argparse.Namespace) -> None:
         next_at = dt.datetime.now() + dt.timedelta(seconds=sleep_for)
         print(f"Next run at {next_at:%Y-%m-%d %H:%M:%S}")
         time.sleep(sleep_for)
-        run_once(config, args)
+        try:
+            run_once(config, args)
+        except Exception as exc:
+            import traceback
+            print(f"Scheduled run failed, continuing schedule: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc()
 
 
 def parse_args() -> argparse.Namespace:
